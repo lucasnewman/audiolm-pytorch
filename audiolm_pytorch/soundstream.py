@@ -709,6 +709,7 @@ class SoundStream(nn.Module):
         self,
         x,
         target = None,
+        use_discriminators = True,
         is_denoising = None, # if you want to learn film conditioners that teach the soundstream to denoise - target would need to be passed in above
         return_encoded = False,
         return_discr_loss = False,
@@ -839,42 +840,45 @@ class SoundStream(nn.Module):
 
         # adversarial loss
 
-        adversarial_losses = []
-
-        discr_intermediates = []
+        adversarial_loss = self.zero
+        feature_loss = self.zero
 
         # adversarial loss for multi-scale discriminators
 
+        adversarial_losses = []
+        discr_intermediates = []
+
         real, fake = orig_x, recon_x
 
-        # features from stft
+        if use_discriminators:
+            # features from stft
+            
+            (stft_real_logits, stft_real_intermediates), (stft_fake_logits, stft_fake_intermediates) = map(partial(self.stft_discriminator, return_intermediates=True), (real, fake))
+            discr_intermediates.append((stft_real_intermediates, stft_fake_intermediates))
 
-        (stft_real_logits, stft_real_intermediates), (stft_fake_logits, stft_fake_intermediates) = map(partial(self.stft_discriminator, return_intermediates=True), (real, fake))
-        discr_intermediates.append((stft_real_intermediates, stft_fake_intermediates))
+            scaled_real, scaled_fake = real, fake
+            for discr, downsample in zip(self.discriminators, self.downsamples):
+                scaled_real, scaled_fake = map(downsample, (scaled_real, scaled_fake))
 
-        scaled_real, scaled_fake = real, fake
-        for discr, downsample in zip(self.discriminators, self.downsamples):
-            scaled_real, scaled_fake = map(downsample, (scaled_real, scaled_fake))
+                (real_logits, real_intermediates), (fake_logits, fake_intermediates) = map(partial(discr, return_intermediates = True), (scaled_real, scaled_fake))
 
-            (real_logits, real_intermediates), (fake_logits, fake_intermediates) = map(partial(discr, return_intermediates = True), (scaled_real, scaled_fake))
+                discr_intermediates.append((real_intermediates, fake_intermediates))
 
-            discr_intermediates.append((real_intermediates, fake_intermediates))
+                one_adversarial_loss = hinge_gen_loss(fake_logits)
+                adversarial_losses.append(one_adversarial_loss)
 
-            one_adversarial_loss = hinge_gen_loss(fake_logits)
-            adversarial_losses.append(one_adversarial_loss)
+            feature_losses = []
 
-        feature_losses = []
+            for real_intermediates, fake_intermediates in discr_intermediates:
+                losses = [F.l1_loss(real_intermediate, fake_intermediate) for real_intermediate, fake_intermediate in zip(real_intermediates, fake_intermediates)]
+                feature_losses.extend(losses)
 
-        for real_intermediates, fake_intermediates in discr_intermediates:
-            losses = [F.l1_loss(real_intermediate, fake_intermediate) for real_intermediate, fake_intermediate in zip(real_intermediates, fake_intermediates)]
-            feature_losses.extend(losses)
+            feature_loss = torch.stack(feature_losses).mean()
 
-        feature_loss = torch.stack(feature_losses).mean()
+            # adversarial loss for stft discriminator
 
-        # adversarial loss for stft discriminator
-
-        adversarial_losses.append(hinge_gen_loss(stft_fake_logits))
-        adversarial_loss = torch.stack(adversarial_losses).mean()
+            adversarial_losses.append(hinge_gen_loss(stft_fake_logits))
+            adversarial_loss = torch.stack(adversarial_losses).mean()
 
         # sum commitment loss
 
